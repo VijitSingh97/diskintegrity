@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Verify release and run safety tests
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+          test "$(bin/diskintegrity --version)" = "diskintegrity $(cat VERSION)"
+          make check test
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "diskintegrity $GITHUB_REF_NAME" \
+            --notes 'A macOS disk health checker: full read scan, --fast sampled check, and destructive --write verify, with SMART details and a PASS/FAIL report. See the README for Homebrew installation. --write erases the selected disk.'

@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "0.0.1"
+DISKUTIL = "/usr/sbin/diskutil"
+SUDO = "/usr/bin/sudo"
+DD = "/bin/dd"
+BLOCK = 4 << 20
+FAST_SAMPLES = 64
+MAX_BAD_REGIONS = 32
+MAX_MISMATCH = 1 << 30
+SLOW_BLOCK_SECONDS = 1.0
+SECTOR_SCAN_SECONDS = 120
+IO_ERROR = "Input/output error"
+WHOLE_DISK = re.compile(r"disk[0-9]+\Z")
+PARTITION = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
+
+
+class Error(Exception):
+    pass
+
+
+def command(args, **kwargs):
+    try:
+        return subprocess.run(args, check=True, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        raise Error(f"Command failed: {args[0]} (exit {exc.returncode}).") from exc
+
+
+def diskutil(*args):
+    result = command([DISKUTIL, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        data = plistlib.loads(result.stdout)
+    except (ValueError, plistlib.InvalidFileException) as exc:
+        raise Error("Cannot read disk information.") from exc
+    if not isinstance(data, dict) or data.get("Error"):
+        raise Error("Cannot read disk information.")
+    return data
+
+
+def info(device):
+    return diskutil("info", "-plist", device)
+
+
+def listed_disks(*filters):
+    listing = diskutil("list", "-plist", *filters)
+    records = listing.get("AllDisksAndPartitions")
+    whole_disks = listing.get("WholeDisks")
+    if not isinstance(records, list) or not isinstance(whole_disks, list) or not all(
+            isinstance(entry, dict) for entry in records):
+        raise Error("Incomplete disk list.")
+    entries = {entry.get("DeviceIdentifier") for entry in records}
+    if any(not isinstance(device, str) or not WHOLE_DISK.fullmatch(device) for device in whole_disks):
+        raise Error("Invalid disk list.")
+    return [device for device in whole_disks if device in entries]
+
+
+def backing_disks(volume):
+    stores = volume.get("APFSPhysicalStores")
+    if "APFSPhysicalStores" in volume:
+        if not isinstance(stores, list) or not stores or not all(
+                isinstance(store, dict) for store in stores):
+            raise Error("Incomplete APFS storage information; refusing to write.")
+        devices = [store.get("APFSPhysicalStore") for store in stores]
+    else:
+        devices = [volume.get("DeviceIdentifier")]
+    physical = set(listed_disks("physical"))
+    protected = set()
+    for device in devices:
+        if not isinstance(device, str) or not PARTITION.fullmatch("/dev/" + device):
+            raise Error("Incomplete disk information; refusing to write.")
+        store = info("/dev/" + device)
+        whole = store.get("ParentWholeDisk") or store.get("DeviceIdentifier")
+        if whole not in physical:
+            raise Error("Unsupported virtual startup storage; refusing to write.")
+        parent = info("/dev/" + whole)
+        if (parent.get("WholeDisk") is not True
+                or parent.get("DeviceIdentifier") != whole
+                or parent.get("DeviceNode") != "/dev/" + whole
+                or parent.get("VirtualOrPhysical") == "Virtual"
+                or parent.get("BusProtocol") == "Disk Image"):
+            raise Error("Cannot verify the physical startup disk; refusing to write.")
+        protected.add(whole)
+    return protected
+
+
+def physical_disk(details, identifier):
+    size = details.get("TotalSize")
+    sector = details.get("DeviceBlockSize")
+    return (details.get("DeviceIdentifier") == identifier
+            and details.get("DeviceNode") == "/dev/" + identifier
+            and details.get("WholeDisk") is True
+            and details.get("VirtualOrPhysical") != "Virtual"
+            and details.get("BusProtocol") != "Disk Image"
+            and type(size) is int and size > 0
+            and type(sector) is int and sector > 0
+            and BLOCK % sector == 0 and size % sector == 0)
+
+
+def writable(details, protected):
+    return (details["DeviceIdentifier"] not in protected
+            and details.get("Internal") is False
+            and details.get("OSInternalMedia") is not True
+            and details.get("RemovableMediaOrExternalDevice") is True
+            and details.get("WritableMedia") is True)
+
+
+def candidate_disks(write):
+    protected = backing_disks(info("/")) if write else set()
+    disks = []
+    for identifier in listed_disks("physical"):
+        details = info("/dev/" + identifier)
+        if physical_disk(details, identifier) and (not write or writable(details, protected)):
+            disks.append(details)
+    return disks
+
+
+def identity(disk):
+    return tuple(disk.get(key) for key in (
+        "DeviceIdentifier", "DeviceNode", "TotalSize", "DeviceBlockSize",
+        "MediaName", "BusProtocol", "DeviceTreePath", "MediaUUID", "DiskUUID"))
+
+
+def recheck(selected):
+    for disk in candidate_disks(True):
+        if identity(disk) == identity(selected):
+            return
+    raise Error("The selected disk changed or is no longer safe; refusing to write.")
+
+
+def label(value):
+    return "".join(char if char.isprintable() else "?" for char in str(value))
+
+
+def size_label(size):
+    return f"{size / 1_000_000_000:.2f} GB"
+
+
+def rate_label(size, seconds):
+    return f"{size / max(seconds, 1e-9) / 1_000_000:.1f} MB/s"
+
+
+def duration(seconds):
+    total = int(seconds)
+    hours, minutes, secs = total // 3600, total % 3600 // 60, total % 60
+    return f"{hours}h {minutes:02d}m {secs:02d}s" if hours else f"{minutes}m {secs:02d}s"
+
+
+def kind(details):
+    solid = details.get("SolidState")
+    return "SSD/flash" if solid is True else "HDD" if solid is False else "unknown media"
+
+
+def describe(details):
+    where = "internal" if details.get("Internal") else "external"
+    return (f"{label(details.get('MediaName') or 'Disk')} | {size_label(details['TotalSize'])} | "
+            f"{details['DeviceNode']} | {label(details.get('BusProtocol') or 'unknown bus')} {where} | "
+            f"{kind(details)}")
+
+
+def choose(disks, wanted, write):
+    if wanted:
+        identifier = re.sub(r"\A(/dev/)?r?", "", wanted)
+        for disk in disks:
+            if disk["DeviceIdentifier"] == identifier:
+                return disk
+        scope = "external, writable, non-startup" if write else "whole physical"
+        raise Error(f"{label(wanted)} is not an eligible {scope} disk.")
+    for number, disk in enumerate(disks, 1):
+        print(f"{number}. {describe(disk)}")
+    while True:
+        answer = input("\nSelect disk number (q to cancel): ").strip()
+        if answer.lower() == "q":
+            return None
+        if answer.isdecimal() and 1 <= int(answer) <= len(disks):
+            return disks[int(answer) - 1]
+        print("Choose a number from the list, or q.")
+
+
+class Progress:
+    def __init__(self, verb, total):
+        self.verb = verb
+        self.total = total
+        self.start = self.shown = self.renewed = time.monotonic()
+
+    def update(self, done, final=False):
+        now = time.monotonic()
+        if now - self.renewed > 60:
+            subprocess.run([SUDO, "-n", "-v"], check=False)
+            self.renewed = now
+        if not final and now - self.shown < 0.5:
+            return
+        self.shown = now
+        elapsed = now - self.start
+        rate = done / max(elapsed, 1e-9)
+        eta = duration((self.total - done) / rate) if rate else "?"
+        sys.stderr.write(f"\r{self.verb} {100 * done / self.total:5.1f}%  {size_label(done)} / "
+                         f"{size_label(self.total)}  {rate_label(done, elapsed)}  ETA {eta}   ")
+        if final:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
+def pattern(seed, index, length):
+    return hashlib.shake_128(seed + index.to_bytes(8, "big")).digest(length)
+
+
+def dd(*operands, **kwargs):
+    return subprocess.Popen([SUDO, "-n", DD, *operands], **kwargs)
+
+
+def stop(proc):
+    subprocess.run([SUDO, "-n", "/bin/kill", "-TERM", str(proc.pid)], check=False)
+
+
+def last_line(errors):
+    lines = [line for line in errors.splitlines() if line.strip()]
+    return label(lines[0] if lines else "no error output")
+
+
+def bad_sectors(raw, offset, length, sector):
+    proc = dd(f"if={raw}", "of=/dev/null", f"bs={sector}", f"skip={offset // sector}",
+              f"count={length // sector}", "conv=noerror,sync",
+              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _, errors = proc.communicate(timeout=SECTOR_SCAN_SECONDS)
+        exact = True
+    except subprocess.TimeoutExpired:
+        stop(proc)
+        _, errors = proc.communicate()
+        exact = False
+    return max(1, errors.decode(errors="replace").count(IO_ERROR)), exact
+
+
+def sample_spans(size, count=FAST_SAMPLES):
+    last = (size - 1) // BLOCK
+    indexes = sorted({round(number * last / max(count - 1, 1)) for number in range(count)})
+    return [(index * BLOCK, min(size, (index + 1) * BLOCK)) for index in indexes]
+
+
+def read_pass(raw, size, sector, seed=None, spans=None):
+    spans = spans or [(0, size)]
+    result = {"bad": [], "slow": 0, "mismatch": 0, "first_mismatch": None, "stopped": None, "bytes": 0}
+    progress = Progress("Verifying" if seed else "Reading", sum(end - start for start, end in spans))
+    for start, end in spans:
+        pos = start
+        while pos < end and not result["stopped"]:
+            if pos % BLOCK:
+                raise Error(f"Unexpected short read at {size_label(pos)}.")
+            proc = dd(f"if={raw}", f"bs={BLOCK}", f"skip={pos // BLOCK}",
+                      f"count={-(-(end - pos) // BLOCK)}",
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                while pos < end and not result["stopped"]:
+                    began = time.monotonic()
+                    chunk = proc.stdout.read(BLOCK)
+                    if not chunk:
+                        break
+                    if time.monotonic() - began > SLOW_BLOCK_SECONDS:
+                        result["slow"] += 1
+                    if seed is not None and chunk != pattern(seed, pos // BLOCK, len(chunk)):
+                        if result["first_mismatch"] is None:
+                            result["first_mismatch"] = pos
+                        result["mismatch"] += len(chunk)
+                        if result["mismatch"] >= MAX_MISMATCH:
+                            result["stopped"] = "over 1 GB failed verification"
+                    pos += len(chunk)
+                    result["bytes"] += len(chunk)
+                    progress.update(result["bytes"])
+            finally:
+                proc.stdout.close()
+                errors = proc.stderr.read().decode(errors="replace")
+                status = proc.wait()
+            if result["stopped"] or pos >= end:
+                break
+            if status == 0:
+                raise Error(f"Read ended early at {size_label(pos)} of {size_label(size)}.")
+            if IO_ERROR not in errors:
+                raise Error(f"Read failed at {size_label(pos)}: {last_line(errors)}")
+            length = min(BLOCK, end - pos)
+            result["bad"].append((pos, *bad_sectors(raw, pos, length, sector)))
+            pos += length
+            result["bytes"] += length
+            progress.update(result["bytes"])
+            if len(result["bad"]) >= MAX_BAD_REGIONS:
+                result["stopped"] = f"{MAX_BAD_REGIONS} unreadable regions"
+        if result["stopped"]:
+            break
+    progress.update(result["bytes"], final=True)
+    result["seconds"] = time.monotonic() - progress.start
+    return result
+
+
+def write_pass(raw, size, seed):
+    progress = Progress("Writing", size)
+    proc = dd(f"of={raw}", f"bs={BLOCK}", "iflag=fullblock", "conv=fsync",
+              stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    pos = 0
+    try:
+        while pos < size:
+            chunk = pattern(seed, pos // BLOCK, min(BLOCK, size - pos))
+            proc.stdin.write(chunk)
+            pos += len(chunk)
+            progress.update(pos)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    finally:
+        errors = proc.stderr.read().decode(errors="replace")
+        status = proc.wait()
+    progress.update(pos, final=True)
+    result = {"bytes": size, "seconds": time.monotonic() - progress.start, "error_at": None}
+    if status:
+        if IO_ERROR not in errors:
+            raise Error(f"Write failed: {last_line(errors)}")
+        written = re.search(r"(\d+) bytes transferred", errors)
+        result["bytes"] = result["error_at"] = int(written.group(1)) if written else pos
+    return result
+
+
+def smart(device):
+    tool = shutil.which("smartctl")
+    if not tool:
+        return {}, "smartctl not installed (brew install smartmontools)"
+    result = subprocess.run([SUDO, "-n", tool, "-j", "-a", device],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        data = None
+    if result.returncode & 3 or not isinstance(data, dict) or not isinstance(data.get("smart_status"), dict):
+        return {}, "SMART not available over this connection"
+    return data, None
+
+
+def smart_findings(data, macos_status):
+    facts, failures, warnings = [], [], []
+    if macos_status == "Failing":
+        failures.append("macOS reports SMART status Failing")
+    if not data:
+        return facts, failures, warnings
+    passed = data["smart_status"].get("passed")
+    facts.append("health PASSED" if passed else "health FAILED")
+    if passed is False:
+        failures.append("SMART overall health check failed")
+    hours = (data.get("power_on_time") or {}).get("hours")
+    if hours is not None:
+        facts.append(f"{hours} power-on hours")
+    temperature = (data.get("temperature") or {}).get("current")
+    if temperature is not None:
+        facts.append(f"{temperature} °C")
+    nvme = data.get("nvme_smart_health_information_log") or {}
+    if nvme.get("percentage_used") is not None:
+        facts.append(f"{nvme['percentage_used']}% endurance used")
+        if nvme["percentage_used"] >= 100:
+            warnings.append("SSD is past its rated write endurance")
+    if nvme.get("data_units_written") is not None:
+        facts.append(f"{size_label(nvme['data_units_written'] * 512_000)} written lifetime")
+    if nvme.get("media_errors") is not None:
+        facts.append(f"{nvme['media_errors']} media errors")
+        if nvme["media_errors"]:
+            failures.append(f"{nvme['media_errors']} NVMe media/data-integrity errors")
+    if nvme.get("critical_warning"):
+        failures.append(f"NVMe critical warning 0x{nvme['critical_warning']:02x}")
+    table = (data.get("ata_smart_attributes") or {}).get("table") or []
+    attributes = {entry.get("id"): (entry.get("raw") or {}).get("value")
+                  for entry in table if isinstance(entry, dict)}
+    for number, name, fatal in ((5, "reallocated", False), (197, "pending", True),
+                                (198, "uncorrectable", True)):
+        value = attributes.get(number)
+        if value is None:
+            continue
+        facts.append(f"{value} {name} sectors")
+        if value:
+            (failures if fatal else warnings).append(f"SMART reports {value} {name} sectors")
+    return facts, failures, warnings
+
+
+MODES = {
+    "fast": f"fast sample scan ({FAST_SAMPLES} x 4 MiB reads)",
+    "full": "full read-only surface scan",
+    "write": "write + verify (destructive)",
+}
+
+
+def report(disk, mode, total_seconds, write, read, smart_data, smart_note):
+    failures, warnings, notes = [], [], []
+    rows = [
+        ("Disk", f"{label(disk.get('MediaName') or 'Disk')} ({disk['DeviceNode']})"),
+        ("Capacity", f"{size_label(disk['TotalSize'])}, {disk['DeviceBlockSize']}-byte sectors"),
+        ("Type", f"{label(disk.get('BusProtocol') or 'unknown bus')} "
+                 f"{'internal' if disk.get('Internal') else 'external'}, {kind(disk)}"),
+        ("Test", MODES[mode]),
+    ]
+    if write:
+        rows.append(("Write speed", f"{rate_label(write['bytes'], write['seconds'])} "
+                                    f"({duration(write['seconds'])})"))
+        if write["error_at"] is not None:
+            failures.append(f"write error at {size_label(write['error_at'])}")
+    if read:
+        rows.append(("Read speed", f"{rate_label(read['bytes'], read['seconds'])} "
+                                   f"({duration(read['seconds'])})"))
+        bad = read["bad"]
+        count = sum(region[1] for region in bad)
+        prefix = "" if all(region[2] for region in bad) else "at least "
+        rows.append(("Bad sectors", f"{prefix}{count}" + (
+            f" in {len(bad)} region(s), first at {size_label(bad[0][0])}" if bad else "")))
+        if bad:
+            failures.append(f"{prefix}{count} unreadable sector(s)")
+        rows.append(("Slow blocks", f"{read['slow']} (4 MiB reads over {SLOW_BLOCK_SECONDS:g} s)"))
+        if read["slow"]:
+            warnings.append(f"{read['slow']} slow 4 MiB read(s): weak or retried sectors")
+        if write:
+            first = read["first_mismatch"]
+            if first is None:
+                rows.append(("Verify", f"{size_label(read['bytes'])} read back intact"))
+            else:
+                rows.append(("Verify", f"{size_label(read['mismatch'])} corrupt, first at {size_label(first)}"))
+                failures.append("written data did not read back intact")
+                if read["mismatch"] == read["bytes"] - first:
+                    notes.append(f"Everything from {size_label(first)} onward is corrupt: likely fake "
+                                 f"capacity (real size about {size_label(first)}).")
+        if read["stopped"]:
+            failures.append(f"scan stopped early: {read['stopped']}")
+    facts, smart_failures, smart_warnings = smart_findings(smart_data, disk.get("SMARTStatus"))
+    failures += smart_failures
+    warnings += smart_warnings
+    smart_parts = [f"macOS: {label(disk.get('SMARTStatus') or 'unknown')}"] + facts
+    if smart_note:
+        smart_parts.append(smart_note)
+    rows.append(("SMART", "; ".join(smart_parts)))
+    rows.append(("Total time", duration(total_seconds)))
+    if mode == "fast":
+        notes.append(f"Fast mode read only {FAST_SAMPLES} samples; run without --fast for a full scan.")
+    if mode != "write":
+        notes.append("A read-only scan cannot detect fake capacity or failing writes; "
+                     "use --write on a disk you can erase.")
+        if mode == "full" and disk.get("SolidState") is not False:
+            notes.append("SSDs answer reads of trimmed space without touching flash, so read "
+                         "speed can look high and unused cells go untested.")
+    print("\ndiskintegrity report")
+    for name, value in rows:
+        print(f"  {name:<12}  {value}")
+    for title, items in (("Failures", failures), ("Warnings", warnings), ("Notes", notes)):
+        if items:
+            print(f"  {title}:")
+            for item in items:
+                print(f"    - {item}")
+    verdict = "FAIL" if failures else "PASS"
+    print(f"\nRESULT: {verdict}")
+    return verdict
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check a macOS disk's health: surface scan, SMART data, optional write test.")
+    parser.add_argument("--version", action="version", version=f"diskintegrity {VERSION}")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--fast", action="store_true",
+                       help=f"quick check: SMART plus {FAST_SAMPLES} sampled reads")
+    modes.add_argument("--write", action="store_true",
+                       help="destructive write-and-verify test of an external disk (erases it)")
+    parser.add_argument("disk", nargs="?", help="whole disk such as disk4 (default: choose from a list)")
+    args = parser.parse_args()
+    if sys.platform != "darwin":
+        raise Error("diskintegrity supports macOS only.")
+    if os.geteuid() == 0:
+        raise Error("Run diskintegrity as your normal user; it requests sudo only for disk access.")
+    if not sys.stdin.isatty():
+        raise Error("Run diskintegrity in an interactive terminal.")
+    disks = candidate_disks(args.write)
+    if not disks:
+        raise Error("No eligible external disks for --write." if args.write else "No physical disks found.")
+    selected = choose(disks, args.disk, args.write)
+    if selected is None:
+        print("Cancelled.")
+        return 0
+    device = selected["DeviceNode"]
+    raw = "/dev/r" + selected["DeviceIdentifier"]
+    size = selected["TotalSize"]
+    print(f"\nSelected: {describe(selected)}")
+    if args.write:
+        print(f"\nALL DATA on {device} ({label(selected.get('MediaName'))}, {size_label(size)}) "
+              "will be erased by the write test.")
+        if input(f"Type {device} to confirm: ").strip() != device:
+            print("Cancelled.")
+            return 0
+    command([SUDO, "-v"])
+    subprocess.Popen(["/usr/bin/caffeinate", "-ims", "-w", str(os.getpid())])
+    started = time.monotonic()
+    write = seed = None
+    if args.write:
+        recheck(selected)
+        command([DISKUTIL, "unmountDisk", device])
+        recheck(selected)
+        seed = os.urandom(16)
+        write = write_pass(raw, size, seed)
+    read = None
+    if not write or write["error_at"] is None:
+        spans = sample_spans(size) if args.fast else None
+        read = read_pass(raw, size, selected["DeviceBlockSize"], seed, spans)
+    smart_data, smart_note = smart(device)
+    mode = "write" if args.write else "fast" if args.fast else "full"
+    verdict = report(selected, mode, time.monotonic() - started, write, read, smart_data, smart_note)
+    if args.write:
+        print(f"The disk now holds test data. To reuse it: diskutil eraseDisk ExFAT DISK {device}")
+    return 0 if verdict == "PASS" else 3
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Error, OSError, EOFError, ValueError) as exc:
+        print(f"\ndiskintegrity: {label(exc)}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\ndiskintegrity: cancelled; a --write test leaves the disk partially overwritten.",
+              file=sys.stderr)
+        sys.exit(130)

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Mock safety tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: make check test
+      - name: Verify installation and completion
+        run: |
+          stage=$(mktemp -d)
+          make install DESTDIR="$stage" PREFIX=/usr
+          test "$("$stage/usr/bin/diskintegrity" --version)" = "diskintegrity $(cat VERSION)"
+          "$stage/usr/bin/diskintegrity" --help
+          zsh -fc 'fpath=("$1" $fpath); autoload -Uz compinit; compinit -D -i; [[ ${_comps[diskintegrity]} == _diskintegrity ]]' -- "$stage/usr/share/zsh/site-functions"
+      - name: Smoke-test public Homebrew installation
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          brew tap vijitsingh97/diskintegrity https://github.com/VijitSingh97/diskintegrity.git
+          brew install vijitsingh97/diskintegrity/diskintegrity
+          brew test vijitsingh97/diskintegrity/diskintegrity

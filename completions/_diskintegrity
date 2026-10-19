@@ -1,0 +1,2 @@
+#compdef diskintegrity
+_arguments '(--write)--fast[quick check with sampled reads]' '(--fast)--write[destructive write-and-verify test]' '(- *)--version' '(- *)'{-h,--help} '1:disk:(/dev/disk<->(N:t))'
