@@ -19,7 +19,7 @@ diskintegrity report
   Read speed    78.4 MB/s (3m 17s)
   Bad sectors   0
   Slow blocks   0 (4 MiB reads over 1 s)
-  SMART         macOS: Not Supported
+  SMART         macOS: Not Supported; SMART not available over this connection
   Total time    3m 17s
 
 RESULT: PASS
