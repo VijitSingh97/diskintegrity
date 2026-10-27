@@ -330,7 +330,7 @@ class DiskIntegrityTests(unittest.TestCase):
                 mock.patch.object(sys.stdin, "isatty", return_value=True), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(DI["main"](), 0)
-        command.assert_called_once_with([DI["SUDO"], "-v"])
+        command.assert_called_once_with([DI["SUDO"], "/usr/bin/true"])
         self.assertEqual(read_pass.call_args.args[:3], ("/dev/sda", selected["TotalSize"], 512))
         self.assertIsNone(read_pass.call_args.args[3])
         write_pass.assert_not_called()
