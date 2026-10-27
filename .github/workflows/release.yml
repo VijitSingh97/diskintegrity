@@ -3,24 +3,96 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish
+        required: true
+        default: v0.1.0
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  APT_SIGNING_FINGERPRINT: 35C62BA9B0F75F049EC1C2472AB8B7C6F47CE1B7
+
+concurrency:
+  group: release-pages
+  cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: macos-latest
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Verify release and run safety tests
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils shellcheck
+      - name: Validate release version and build package
         run: |
-          test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          test "$RELEASE_TAG" = "v$(cat VERSION)"
           test "$(bin/diskintegrity --version)" = "diskintegrity $(cat VERSION)"
-          make check test
-      - name: Publish release
+          make test check deb
+          shellcheck scripts/*.sh
+          dpkg-deb --info dist/*.deb
+      - name: Import signing key and build APT feed
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
+          ./scripts/build-apt.sh
+          gpg --verify public/InRelease
+      - name: Verify the signed feed with APT
+        run: |
+          state=$(mktemp -d)
+          chmod 755 "$state"
+          mkdir -p "$state/lists/partial" "$state/download"
+          cp -R public "$state/feed"
+          chmod -R a+rX "$state/feed"
+          gpg --show-keys "$state/feed/diskintegrity.asc"
+          printf 'deb [signed-by=%s/feed/diskintegrity.asc] file:%s/feed ./\n' "$state" "$state" > "$state/sources.list"
+          options=(-o "Dir::Etc::sourcelist=$state/sources.list" -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$state/lists")
+          sudo apt-get "${options[@]}" update
+          cd "$state/download"
+          sudo apt-get "${options[@]}" download diskintegrity
+          dpkg-deb --info ./*.deb
+      - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "diskintegrity $GITHUB_REF_NAME" \
-            --notes 'A macOS disk health checker: full read scan, --fast sampled check, and destructive --write verify, with SMART details and a PASS/FAIL report. See the README for Homebrew installation. --write erases the selected disk.'
+          cd dist
+          sha256sum ./*.deb > SHA256SUMS
+          gh release create "$RELEASE_TAG" ./*.deb SHA256SUMS --verify-tag \
+            --repo "$GITHUB_REPOSITORY" --title "diskintegrity $RELEASE_TAG" \
+            --notes-file ../CHANGELOG.md
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Deploy signed APT feed
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

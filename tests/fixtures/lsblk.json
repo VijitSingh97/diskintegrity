@@ -1,0 +1,129 @@
+{
+  "blockdevices": [
+    {
+      "name": "nvme0n1",
+      "path": "/dev/nvme0n1",
+      "type": "disk",
+      "size": 1000204886016,
+      "log-sec": 512,
+      "ro": false,
+      "rm": false,
+      "hotplug": false,
+      "tran": "nvme",
+      "model": "Production NVMe",
+      "rota": false,
+      "serial": "SYSTEM123",
+      "wwn": "eui.system123",
+      "mountpoints": [null],
+      "pkname": null,
+      "children": [
+        {
+          "name": "nvme0n1p3",
+          "path": "/dev/nvme0n1p3",
+          "type": "part",
+          "size": 999000000000,
+          "log-sec": 512,
+          "ro": false,
+          "rm": false,
+          "hotplug": false,
+          "tran": null,
+          "model": null,
+          "rota": false,
+          "serial": null,
+          "wwn": null,
+          "mountpoints": [null],
+          "pkname": "nvme0n1",
+          "children": [
+            {
+              "name": "ubuntu--vg-root",
+              "path": "/dev/mapper/ubuntu--vg-root",
+              "type": "lvm",
+              "size": 900000000000,
+              "log-sec": 512,
+              "ro": false,
+              "rm": false,
+              "hotplug": false,
+              "tran": null,
+              "model": null,
+              "rota": false,
+              "serial": null,
+              "wwn": null,
+              "mountpoints": ["/"],
+              "pkname": "nvme0n1p3"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sda",
+      "path": "/dev/sda",
+      "type": "disk",
+      "size": 16000000000,
+      "log-sec": 512,
+      "ro": false,
+      "rm": true,
+      "hotplug": true,
+      "tran": "usb",
+      "model": "Test USB",
+      "rota": true,
+      "serial": "USB123",
+      "wwn": null,
+      "mountpoints": [null],
+      "pkname": null
+    },
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "type": "disk",
+      "size": 32000000000,
+      "log-sec": 512,
+      "ro": false,
+      "rm": true,
+      "hotplug": true,
+      "tran": "usb",
+      "model": "Mounted USB",
+      "rota": true,
+      "serial": "USB456",
+      "wwn": null,
+      "mountpoints": [null],
+      "pkname": null,
+      "children": [
+        {
+          "name": "sdb1",
+          "path": "/dev/sdb1",
+          "type": "part",
+          "size": 31900000000,
+          "log-sec": 512,
+          "ro": false,
+          "rm": true,
+          "hotplug": true,
+          "tran": null,
+          "model": null,
+          "rota": true,
+          "serial": null,
+          "wwn": null,
+          "mountpoints": ["/srv/data"],
+          "pkname": "sdb"
+        }
+      ]
+    },
+    {
+      "name": "sdc",
+      "path": "/dev/sdc",
+      "type": "disk",
+      "size": 8000000000,
+      "log-sec": 512,
+      "ro": true,
+      "rm": true,
+      "hotplug": true,
+      "tran": "usb",
+      "model": "Read-only USB",
+      "rota": true,
+      "serial": "USB789",
+      "wwn": null,
+      "mountpoints": [null],
+      "pkname": null
+    }
+  ]
+}

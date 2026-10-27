@@ -10,21 +10,80 @@ permissions:
 
 jobs:
   test:
-    name: Mock safety tests
-    runs-on: macos-latest
+    name: CLI tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install test tools on macOS
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+      - name: Install test tools on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck smartmontools sudo util-linux zsh
       - run: make check test
+      - run: shellcheck scripts/*.sh
       - name: Verify installation and completion
         run: |
           stage=$(mktemp -d)
           make install DESTDIR="$stage" PREFIX=/usr
           test "$("$stage/usr/bin/diskintegrity" --version)" = "diskintegrity $(cat VERSION)"
-          "$stage/usr/bin/diskintegrity" --help
           zsh -fc 'fpath=("$1" $fpath); autoload -Uz compinit; compinit -D -i; [[ ${_comps[diskintegrity]} == _diskintegrity ]]' -- "$stage/usr/share/zsh/site-functions"
       - name: Smoke-test public Homebrew installation
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && runner.os == 'macOS' && hashFiles('Formula/diskintegrity.rb') != ''
         run: |
           brew tap vijitsingh97/diskintegrity https://github.com/VijitSingh97/diskintegrity.git
           brew install vijitsingh97/diskintegrity/diskintegrity
           brew test vijitsingh97/diskintegrity/diskintegrity
+
+  package:
+    name: Package install (${{ matrix.container }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [ubuntu:22.04, ubuntu:24.04, debian:12-slim]
+    container: ${{ matrix.container }}
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git make python3 sudo zsh shellcheck
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Trust the container checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: make check test deb
+      - name: Test package installation
+        run: |
+          apt-get install -y --no-install-recommends ./dist/*.deb
+          test "$(diskintegrity --version)" = "diskintegrity $(cat VERSION)"
+          diskintegrity --help
+          zsh -fc 'autoload -Uz compinit; compinit -D; [[ ${_comps[diskintegrity]} == _diskintegrity ]]'
+
+  apt-install:
+    name: Public APT install (${{ matrix.container }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [ubuntu:22.04, ubuntu:24.04, debian:12-slim]
+    container: ${{ matrix.container }}
+    steps:
+      - name: Install from the signed feed
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl
+          install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://vijitsingh97.github.io/diskintegrity/diskintegrity.asc -o /etc/apt/keyrings/diskintegrity.asc
+          chmod 0644 /etc/apt/keyrings/diskintegrity.asc
+          printf 'Types: deb\nURIs: https://vijitsingh97.github.io/diskintegrity/\nSuites: ./\nSigned-By: /etc/apt/keyrings/diskintegrity.asc\n' > /etc/apt/sources.list.d/diskintegrity.sources
+          apt-get update
+          apt-get install -y --no-install-recommends diskintegrity
+          diskintegrity --version
+          diskintegrity --help

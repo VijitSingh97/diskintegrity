@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 from pathlib import Path
 import runpy
 import subprocess
@@ -75,6 +76,11 @@ def disk(identifier="disk9", **changes):
     return result
 
 
+def linux_fixture():
+    path = Path(__file__).parent / "fixtures" / "lsblk.json"
+    return json.loads(path.read_text())["blockdevices"]
+
+
 class DiskIntegrityTests(unittest.TestCase):
     def setUp(self):
         for name in ("run", "Popen"):
@@ -133,6 +139,8 @@ class DiskIntegrityTests(unittest.TestCase):
         self.assertEqual(verdict, "PASS")
         self.assertIn("Bad sectors   0", text)
         self.assertIn("cannot detect fake capacity", text)
+        self.assertIn("Warnings:", text)
+        self.assertIn("smartctl not installed", text)
 
     def test_fast_mode_reads_only_samples(self):
         data = bytes(100 * BLOCK)
@@ -206,6 +214,54 @@ class DiskIntegrityTests(unittest.TestCase):
         self.assertEqual(warnings, ["SMART reports 8 reallocated sectors"])
         self.assertEqual(DI["smart_findings"]({}, "Failing")[1], ["macOS reports SMART status Failing"])
 
+        status = {"smart_status": {"passed": True},
+                  "_diskintegrity_smartctl_status": 8 | 16 | 32 | 64 | 128}
+        _, failures, warnings = DI["smart_findings"](status, None)
+        self.assertEqual(failures, ["SMART status reports the disk is failing",
+                                    "SMART prefail attributes are at or below threshold",
+                                    "SMART self-test log contains failed tests"])
+        self.assertEqual(warnings, ["SMART attributes crossed a failure threshold in the past",
+                                    "SMART device error log contains errors"])
+
+    def test_smart_reports_missing_and_unsupported_tools_cleanly(self):
+        with mock.patch("shutil.which", return_value=None), \
+                mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(DI["smart"]("/dev/sda"),
+                             ({}, "smartctl not installed (apt install smartmontools)"))
+        result = mock.Mock(stdout=b"{}", returncode=2)
+        with mock.patch("shutil.which", return_value="/fake/smartctl"), \
+                mock.patch.object(subprocess, "run", return_value=result) as run:
+            data, note = DI["smart"]("/dev/sda")
+        self.assertEqual(data["_diskintegrity_smartctl_status"], 2)
+        self.assertEqual(note, "SMART not available over this connection")
+        run.assert_called_once_with([DI["SUDO"], "-n", "/fake/smartctl", "-j", "-a", "/dev/sda"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+
+        result = mock.Mock(stdout=b'{"smart_status":{"passed":true}}', returncode=4)
+        with mock.patch("shutil.which", return_value="/fake/smartctl"), \
+                mock.patch.object(subprocess, "run", return_value=result):
+            data, note = DI["smart"]("/dev/sda")
+        self.assertEqual(data["_diskintegrity_smartctl_status"], 4)
+        self.assertEqual(note, "SMART data incomplete (missing health result or command/checksum error)")
+
+        for output, status in ((b'{"smart_status":{"passed":true}}', 4 | 8),
+                               (b"not json", 4 | 16), (b"not json", 4 | 128)):
+            result = mock.Mock(stdout=output, returncode=status)
+            with mock.patch("shutil.which", return_value="/fake/smartctl"), \
+                    mock.patch.object(subprocess, "run", return_value=result):
+                data, note = DI["smart"]("/dev/sda")
+            _, failures, _ = DI["smart_findings"](data, None)
+            self.assertTrue(failures)
+            self.assertEqual(data["_diskintegrity_smartctl_status"], status)
+            self.assertIsNotNone(note)
+
+        result = mock.Mock(stdout=b'{"smart_status":{"passed":"yes"}}', returncode=0)
+        with mock.patch("shutil.which", return_value="/fake/smartctl"), \
+                mock.patch.object(subprocess, "run", return_value=result):
+            data, note = DI["smart"]("/dev/sda")
+        self.assertEqual(DI["smart_findings"](data, None), ([], [], []))
+        self.assertEqual(note, "SMART data incomplete (missing health result or command/checksum error)")
+
     def test_write_candidates_exclude_internal_and_startup_disks(self):
         disks = {"disk0": disk("disk0", Internal=True, RemovableMediaOrExternalDevice=False),
                  "disk4": disk("disk4"), "disk5": disk("disk5"),
@@ -217,6 +273,66 @@ class DiskIntegrityTests(unittest.TestCase):
             self.assertEqual([d["DeviceIdentifier"] for d in DI["candidate_disks"](True)], ["disk4"])
             self.assertEqual([d["DeviceIdentifier"] for d in DI["candidate_disks"](False)],
                              ["disk0", "disk4", "disk5"])
+
+    def test_linux_inventory_includes_disks_but_writes_only_unmounted_external(self):
+        with mock.patch.dict(DI, {"lsblk": mock.Mock(return_value=linux_fixture())}), \
+                mock.patch.object(sys, "platform", "linux"):
+            readable = DI["candidate_disks"](False)
+            writable = DI["candidate_disks"](True)
+        self.assertEqual([item["DeviceIdentifier"] for item in readable],
+                         ["nvme0n1", "sda", "sdb", "sdc"])
+        self.assertEqual([item["DeviceIdentifier"] for item in writable], ["sda"])
+        system = readable[0]
+        self.assertTrue(system["LinuxMounted"])
+        self.assertEqual(system["DeviceNode"], "/dev/nvme0n1")
+        self.assertEqual(system["BusProtocol"], "NVME")
+        self.assertTrue(system["SolidState"])
+
+    def test_linux_invalid_mount_data_fails_closed(self):
+        devices = linux_fixture()
+        devices[1]["mountpoints"] = "unexpected"
+        with mock.patch.dict(DI, {"lsblk": mock.Mock(return_value=devices)}), \
+                mock.patch.object(sys, "platform", "linux"), \
+                self.assertRaisesRegex(Error, "Invalid Linux mount information"):
+            DI["candidate_disks"](True)
+
+    def test_linux_missing_mount_data_fails_closed(self):
+        devices = linux_fixture()
+        del devices[1]["mountpoints"]
+        with mock.patch.dict(DI, {"lsblk": mock.Mock(return_value=devices)}), \
+                mock.patch.object(sys, "platform", "linux"), \
+                self.assertRaisesRegex(Error, "Missing Linux mount information"):
+            DI["candidate_disks"](True)
+
+    def test_linux_recheck_rejects_disk_that_became_mounted(self):
+        selected = DI["linux_disk"](linux_fixture()[1])
+        changed = dict(selected, LinuxMounted=True, WritableMedia=False)
+        with mock.patch.dict(DI, {"candidate_disks": mock.Mock(return_value=[changed])}), \
+                self.assertRaisesRegex(Error, "no longer safe"):
+            DI["recheck"](selected)
+
+    def test_linux_fast_mode_uses_whole_block_device_read_only(self):
+        selected = DI["linux_disk"](linux_fixture()[1])
+        read_pass = mock.Mock(return_value={"bytes": BLOCK, "seconds": 1, "bad": [],
+                                            "slow": 0, "mismatch": 0,
+                                            "first_mismatch": None, "stopped": None})
+        command = mock.Mock()
+        write_pass = mock.Mock()
+        with mock.patch.dict(DI, {"candidate_disks": mock.Mock(return_value=[selected]),
+                                  "command": command, "read_pass": read_pass,
+                                  "write_pass": write_pass,
+                                  "smart": mock.Mock(return_value=({}, "SMART unavailable")),
+                                  "report": mock.Mock(return_value="PASS")}), \
+                mock.patch.object(sys, "argv", ["diskintegrity", "--fast", "/dev/sda"]), \
+                mock.patch.object(sys, "platform", "linux"), \
+                mock.patch("os.geteuid", return_value=1000), \
+                mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(DI["main"](), 0)
+        command.assert_called_once_with([DI["SUDO"], "-v"])
+        self.assertEqual(read_pass.call_args.args[:3], ("/dev/sda", selected["TotalSize"], 512))
+        self.assertIsNone(read_pass.call_args.args[3])
+        write_pass.assert_not_called()
 
     def test_choose_accepts_raw_and_dev_paths_and_rejects_others(self):
         disks = [disk("disk4")]

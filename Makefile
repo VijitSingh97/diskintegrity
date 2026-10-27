@@ -1,13 +1,15 @@
 PREFIX ?= /usr/local
+DESTDIR ?=
+PYTHON ?= python3
 ZSH_COMPLETION_DIR ?= $(PREFIX)/share/zsh/site-functions
 
-.PHONY: test check install uninstall
+.PHONY: test check install uninstall deb
 
 test:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -v
 
 check:
-	python3 -c 'from pathlib import Path; p = Path("bin/diskintegrity"); compile(p.read_text(), str(p), "exec")'
+	$(PYTHON) -c 'from pathlib import Path; p = Path("bin/diskintegrity"); compile(p.read_text(), str(p), "exec")'
 
 install:
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(ZSH_COMPLETION_DIR)"
@@ -16,3 +18,6 @@ install:
 
 uninstall:
 	rm -f "$(DESTDIR)$(PREFIX)/bin/diskintegrity" "$(DESTDIR)$(ZSH_COMPLETION_DIR)/_diskintegrity"
+
+deb:
+	./scripts/build-deb.sh
