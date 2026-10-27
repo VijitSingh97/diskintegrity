@@ -10,8 +10,9 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.0.1"
+VERSION = "0.1.0"
 DISKUTIL = "/usr/sbin/diskutil"
+LSBLK = "/usr/bin/lsblk"
 SUDO = "/usr/bin/sudo"
 DD = "/bin/dd"
 BLOCK = 4 << 20
@@ -23,6 +24,7 @@ SECTOR_SCAN_SECONDS = 120
 IO_ERROR = "Input/output error"
 WHOLE_DISK = re.compile(r"disk[0-9]+\Z")
 PARTITION = re.compile(r"/dev/disk[0-9]+(?:s[0-9]+)*\Z")
+LINUX_DEVICE = re.compile(r"/dev/[A-Za-z0-9._+:-]+\Z")
 
 
 class Error(Exception):
@@ -45,6 +47,20 @@ def diskutil(*args):
     if not isinstance(data, dict) or data.get("Error"):
         raise Error("Cannot read disk information.")
     return data
+
+
+def lsblk():
+    fields = ("NAME,PATH,TYPE,SIZE,LOG-SEC,RO,RM,HOTPLUG,TRAN,MODEL,ROTA,"
+              "SERIAL,WWN,MOUNTPOINTS,PKNAME")
+    result = command([LSBLK, "--json", "--bytes", "--output", fields],
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise Error("Cannot read Linux block device information.") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("blockdevices"), list):
+        raise Error("Incomplete Linux block device list.")
+    return data["blockdevices"]
 
 
 def info(device):
@@ -114,7 +130,84 @@ def writable(details, protected):
             and details.get("WritableMedia") is True)
 
 
+def linux_disk(node):
+    name = node.get("name")
+    path = node.get("path")
+    size = node.get("size")
+    sector = node.get("log-sec")
+    if (node.get("type") != "disk" or not isinstance(name, str)
+            or not isinstance(path, str) or not LINUX_DEVICE.fullmatch(path)
+            or path != "/dev/" + name or type(size) is not int or size <= 0
+            or type(sector) is not int or sector <= 0 or BLOCK % sector
+            or size % sector):
+        return None
+    external = node.get("rm") is True or node.get("hotplug") is True
+    transport = node.get("tran")
+    mounted = any(mount for item in walk_linux(node) for mount in linux_mounts(item))
+    rota = node.get("rota")
+    model = node.get("model")
+    return {
+        "DeviceIdentifier": name,
+        "DeviceNode": path,
+        "WholeDisk": True,
+        "VirtualOrPhysical": "Physical",
+        "Internal": not external,
+        "OSInternalMedia": not external,
+        "RemovableMediaOrExternalDevice": external,
+        "WritableMedia": node.get("ro") is False and not mounted,
+        "TotalSize": size,
+        "DeviceBlockSize": sector,
+        "MediaName": model.strip() if isinstance(model, str) and model.strip() else name,
+        "BusProtocol": str(transport).upper() if transport else "unknown bus",
+        "SolidState": not rota if type(rota) is bool else None,
+        "SMARTStatus": None,
+        "LinuxMounted": mounted,
+        "LinuxSerial": node.get("serial"),
+        "LinuxWWN": node.get("wwn"),
+    }
+
+
+def walk_linux(node):
+    if not isinstance(node, dict):
+        raise Error("Invalid Linux block device list.")
+    yield node
+    children = node.get("children", [])
+    if not isinstance(children, list):
+        raise Error("Invalid Linux block device list.")
+    for child in children:
+        yield from walk_linux(child)
+
+
+def linux_mounts(node):
+    if "mountpoints" not in node and "mountpoint" not in node:
+        raise Error("Missing Linux mount information; refusing to write.")
+    mounts = node.get("mountpoints")
+    if mounts is None:
+        mount = node.get("mountpoint")
+        return [mount] if mount else []
+    if not isinstance(mounts, list):
+        raise Error("Invalid Linux mount information; refusing to write.")
+    if any(mount is not None and not isinstance(mount, str) for mount in mounts):
+        raise Error("Invalid Linux mount information; refusing to write.")
+    return mounts
+
+
+def linux_disks():
+    disks = []
+    seen = set()
+    for root in lsblk():
+        for node in walk_linux(root):
+            details = linux_disk(node)
+            if details and details["DeviceIdentifier"] not in seen:
+                disks.append(details)
+                seen.add(details["DeviceIdentifier"])
+    return disks
+
+
 def candidate_disks(write):
+    if sys.platform.startswith("linux"):
+        disks = linux_disks()
+        return [disk for disk in disks if not write or writable(disk, set())]
     protected = backing_disks(info("/")) if write else set()
     disks = []
     for identifier in listed_disks("physical"):
@@ -127,7 +220,8 @@ def candidate_disks(write):
 def identity(disk):
     return tuple(disk.get(key) for key in (
         "DeviceIdentifier", "DeviceNode", "TotalSize", "DeviceBlockSize",
-        "MediaName", "BusProtocol", "DeviceTreePath", "MediaUUID", "DiskUUID"))
+        "MediaName", "BusProtocol", "DeviceTreePath", "MediaUUID", "DiskUUID",
+        "LinuxSerial", "LinuxWWN", "LinuxMounted"))
 
 
 def recheck(selected):
@@ -330,28 +424,50 @@ def write_pass(raw, size, seed):
 def smart(device):
     tool = shutil.which("smartctl")
     if not tool:
-        return {}, "smartctl not installed (brew install smartmontools)"
+        install = ("apt install smartmontools" if sys.platform.startswith("linux")
+                   else "brew install smartmontools")
+        return {}, f"smartctl not installed ({install})"
     result = subprocess.run([SUDO, "-n", tool, "-j", "-a", device],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
     try:
         data = json.loads(result.stdout)
     except ValueError:
-        data = None
-    if result.returncode & 3 or not isinstance(data, dict) or not isinstance(data.get("smart_status"), dict):
-        return {}, "SMART not available over this connection"
-    return data, None
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["_diskintegrity_smartctl_status"] = result.returncode
+    smart_status = data.get("smart_status")
+    if result.returncode & 3 or not isinstance(smart_status, dict):
+        note = "SMART not available over this connection"
+    elif result.returncode & 4 or type(smart_status.get("passed")) is not bool:
+        note = "SMART data incomplete (missing health result or command/checksum error)"
+    else:
+        note = None
+    return data, note
 
 
 def smart_findings(data, macos_status):
     facts, failures, warnings = [], [], []
     if macos_status == "Failing":
         failures.append("macOS reports SMART status Failing")
-    if not data:
-        return facts, failures, warnings
-    passed = data["smart_status"].get("passed")
-    facts.append("health PASSED" if passed else "health FAILED")
+    status = data.get("_diskintegrity_smartctl_status", 0)
+    smart_status = data.get("smart_status")
+    passed = smart_status.get("passed") if (isinstance(smart_status, dict)
+                                             and type(smart_status.get("passed")) is bool) else None
+    if passed is not None:
+        facts.append("health PASSED" if passed else "health FAILED")
     if passed is False:
         failures.append("SMART overall health check failed")
+    elif status & 8:
+        failures.append("SMART status reports the disk is failing")
+    if status & 16:
+        failures.append("SMART prefail attributes are at or below threshold")
+    if status & 32:
+        warnings.append("SMART attributes crossed a failure threshold in the past")
+    if status & 64:
+        warnings.append("SMART device error log contains errors")
+    if status & 128:
+        failures.append("SMART self-test log contains failed tests")
     hours = (data.get("power_on_time") or {}).get("hours")
     if hours is not None:
         facts.append(f"{hours} power-on hours")
@@ -434,9 +550,12 @@ def report(disk, mode, total_seconds, write, read, smart_data, smart_note):
     facts, smart_failures, smart_warnings = smart_findings(smart_data, disk.get("SMARTStatus"))
     failures += smart_failures
     warnings += smart_warnings
-    smart_parts = [f"macOS: {label(disk.get('SMARTStatus') or 'unknown')}"] + facts
+    smart_parts = facts
+    if not sys.platform.startswith("linux"):
+        smart_parts.insert(0, f"macOS: {label(disk.get('SMARTStatus') or 'unknown')}")
     if smart_note:
         smart_parts.append(smart_note)
+        warnings.append(smart_note)
     rows.append(("SMART", "; ".join(smart_parts)))
     rows.append(("Total time", duration(total_seconds)))
     if mode == "fast":
@@ -462,7 +581,7 @@ def report(disk, mode, total_seconds, write, read, smart_data, smart_note):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Check a macOS disk's health: surface scan, SMART data, optional write test.")
+        description="Check a disk's health: surface scan, SMART data, optional write test.")
     parser.add_argument("--version", action="version", version=f"diskintegrity {VERSION}")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--fast", action="store_true",
@@ -471,8 +590,8 @@ def main():
                        help="destructive write-and-verify test of an external disk (erases it)")
     parser.add_argument("disk", nargs="?", help="whole disk such as disk4 (default: choose from a list)")
     args = parser.parse_args()
-    if sys.platform != "darwin":
-        raise Error("diskintegrity supports macOS only.")
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise Error("diskintegrity supports macOS and Linux only.")
     if os.geteuid() == 0:
         raise Error("Run diskintegrity as your normal user; it requests sudo only for disk access.")
     if not sys.stdin.isatty():
@@ -485,7 +604,7 @@ def main():
         print("Cancelled.")
         return 0
     device = selected["DeviceNode"]
-    raw = "/dev/r" + selected["DeviceIdentifier"]
+    raw = selected["DeviceNode"] if sys.platform.startswith("linux") else "/dev/r" + selected["DeviceIdentifier"]
     size = selected["TotalSize"]
     print(f"\nSelected: {describe(selected)}")
     if args.write:
@@ -495,13 +614,15 @@ def main():
             print("Cancelled.")
             return 0
     command([SUDO, "-v"])
-    subprocess.Popen(["/usr/bin/caffeinate", "-ims", "-w", str(os.getpid())])
+    if sys.platform == "darwin":
+        subprocess.Popen(["/usr/bin/caffeinate", "-ims", "-w", str(os.getpid())])
     started = time.monotonic()
     write = seed = None
     if args.write:
         recheck(selected)
-        command([DISKUTIL, "unmountDisk", device])
-        recheck(selected)
+        if sys.platform == "darwin":
+            command([DISKUTIL, "unmountDisk", device])
+            recheck(selected)
         seed = os.urandom(16)
         write = write_pass(raw, size, seed)
     read = None
@@ -512,7 +633,10 @@ def main():
     mode = "write" if args.write else "fast" if args.fast else "full"
     verdict = report(selected, mode, time.monotonic() - started, write, read, smart_data, smart_note)
     if args.write:
-        print(f"The disk now holds test data. To reuse it: diskutil eraseDisk ExFAT DISK {device}")
+        if sys.platform == "darwin":
+            print(f"The disk now holds test data. To reuse it: diskutil eraseDisk ExFAT DISK {device}")
+        else:
+            print("The disk now holds test data. Partition and format it before reuse.")
     return 0 if verdict == "PASS" else 3
 
 
