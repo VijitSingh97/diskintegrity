@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.0.2"
 DISKUTIL = "/usr/sbin/diskutil"
 LSBLK = "/usr/bin/lsblk"
 SUDO = "/usr/bin/sudo"
@@ -289,7 +289,7 @@ class Progress:
     def update(self, done, final=False):
         now = time.monotonic()
         if now - self.renewed > 60:
-            subprocess.run([SUDO, "-n", "-v"], check=False)
+            subprocess.run([SUDO, "-n", "/usr/bin/true"], check=False)
             self.renewed = now
         if not final and now - self.shown < 0.5:
             return
@@ -613,7 +613,7 @@ def main():
         if input(f"Type {device} to confirm: ").strip() != device:
             print("Cancelled.")
             return 0
-    command([SUDO, "-v"])
+    command([SUDO, "/usr/bin/true"])
     if sys.platform == "darwin":
         subprocess.Popen(["/usr/bin/caffeinate", "-ims", "-w", str(os.getpid())])
     started = time.monotonic()
