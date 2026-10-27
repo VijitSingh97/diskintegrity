@@ -269,7 +269,8 @@ class DiskIntegrityTests(unittest.TestCase):
         listing = mock.Mock(return_value=list(disks))
         details = mock.Mock(side_effect=lambda device: disks.get(device[5:], {}))
         with mock.patch.dict(DI, {"listed_disks": listing, "info": details,
-                                  "backing_disks": mock.Mock(return_value={"disk5"})}):
+                                  "backing_disks": mock.Mock(return_value={"disk5"})}), \
+                mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual([d["DeviceIdentifier"] for d in DI["candidate_disks"](True)], ["disk4"])
             self.assertEqual([d["DeviceIdentifier"] for d in DI["candidate_disks"](False)],
                              ["disk0", "disk4", "disk5"])
